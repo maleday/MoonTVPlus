@@ -50,6 +50,7 @@ interface DbRecord {
   id: string;
   playProgressSec: number;
   durationSec: number;
+  createdAt: number;
   lastPlayedAt: number;
   name: string;
   artist: string;
@@ -243,7 +244,13 @@ export default function MusicPage() {
     setResolvingCount((prev) => Math.max(0, prev - 1));
   };
 
-  const saveHistoryRecord = async (record: PlayRecord, song: Song, playTime: number, totalDuration: number) => {
+  const saveHistoryRecord = async (
+    record: PlayRecord,
+    song: Song,
+    playTime: number,
+    totalDuration: number,
+    lastPlayedAt = Date.now()
+  ) => {
     await fetch('/api/music/v2/history', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -260,9 +267,21 @@ export default function MusicPage() {
           durationText: song.durationText,
         },
         playProgressSec: playTime,
-        lastPlayedAt: Date.now(),
+        lastPlayedAt,
         lastQuality: quality,
       }),
+    });
+  };
+
+  const saveHistoryRecordSafely = (
+    record: PlayRecord,
+    song: Song,
+    playTime = 0,
+    totalDuration = 0,
+    lastPlayedAt?: number
+  ) => {
+    saveHistoryRecord(record, song, playTime, totalDuration, lastPlayedAt).catch(err => {
+      console.error('保存播放记录到数据库失败:', err);
     });
   };
 
@@ -308,15 +327,17 @@ export default function MusicPage() {
         const history = await response.json();
         const dbRecords = (history.data?.records || []) as DbRecord[];
 
-        const sortedRecords: PlayRecord[] = dbRecords.map((record) => ({
+        const queueRecords = dbRecords;
+
+        const sortedRecords: PlayRecord[] = queueRecords.map((record) => ({
           platform: record.source,
           id: record.songId,
           playTime: record.playProgressSec,
           duration: record.durationSec || 0,
-          timestamp: record.lastPlayedAt,
+          timestamp: record.createdAt || record.lastPlayedAt || 0,
         }));
 
-        const sortedSongs: Song[] = dbRecords.map((record) => ({
+        const sortedSongs: Song[] = queueRecords.map((record) => ({
           id: record.songId,
           name: record.name,
           artist: record.artist,
@@ -351,12 +372,17 @@ export default function MusicPage() {
         if (sortedRecords.length > 0) {
           const proxyEnabled = getMusicProxyEnabled();
           setMusicProxyEnabled(proxyEnabled);
-          const latestDbRecord = sortedRecords[0];
-          const latestDbSong = sortedSongs[0];
+          const latestIndex = queueRecords.reduce((bestIndex, record, index) => {
+            if (bestIndex < 0) return index;
+            return (record.lastPlayedAt || 0) > (queueRecords[bestIndex].lastPlayedAt || 0) ? index : bestIndex;
+          }, -1);
+          const activeIndex = latestIndex >= 0 ? latestIndex : 0;
+          const latestDbRecord = sortedRecords[activeIndex];
+          const latestDbSong = sortedSongs[activeIndex];
 
           // 使用数据库的歌曲信息
           setCurrentSong(latestDbSong);
-          setPlaylistIndex(0);
+          setPlaylistIndex(activeIndex);
           setShowPlayer(true);
 
           // 从数据库恢复播放进度
@@ -646,6 +672,7 @@ export default function MusicPage() {
 
     setPlayRecords((prev) => [...prev, record]);
     setPlaylist((prev) => [...prev, { ...song, platform }]);
+    saveHistoryRecordSafely(record, { ...song, platform }, 0, song.duration || 0, 0);
     setToast({
       message: '已加入稍后播放',
       type: 'success',
@@ -941,7 +968,7 @@ export default function MusicPage() {
         platform: platform,
         id: song.id,
         playTime: 0, // 初始播放时间
-        duration: 0, // 将在音频加载后更新
+        duration: song.duration || 0, // 将在音频加载后更新
         timestamp: Date.now(),
       };
 
@@ -972,6 +999,8 @@ export default function MusicPage() {
           return [...prev, { ...song, platform }];
         }
       });
+
+      saveHistoryRecordSafely(record, { ...song, platform }, 0, song.duration || 0);
 
       if (proxyEnabled) {
         const streamUrl = buildStreamUrl(song, platform, quality);
